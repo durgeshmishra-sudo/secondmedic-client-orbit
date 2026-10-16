@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791968450596,
+      "tag": "0000_rapid_scalphunter",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791995366854,
+      "tag": "0001_marvelous_slyde",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792005603642,
+      "tag": "0002_chubby_madelyne_pryor",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792009289324,
+      "tag": "0003_magical_santa_claus",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1792069308176,
+      "tag": "0004_wise_starbolt",
+      "breakpoints": true
+    }
+  ]
+}
