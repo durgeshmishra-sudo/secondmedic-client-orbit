@@ -1,6 +1,5 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
-import { getLocalSessionMember, hashPassword, publicMember } from "../../crm-auth";
 import { getDb } from "../../../db";
 import {
   crmActivityEvents, crmAgreements, crmClients, crmColdCalls, crmDocuments,
@@ -175,11 +174,9 @@ async function ensurePipelineSettings(db: ReturnType<typeof getDb>) {
 }
 
 async function actor() {
-  const db = getDb();
-  const localMember = await getLocalSessionMember(db);
-  if (localMember) return localMember;
   const identity = await getChatGPTUser();
   if (!identity) throw new Error("Please sign in with ChatGPT to use the CRM.");
+  const db = getDb();
   const [existing] = await db.select().from(crmMembers).where(eq(crmMembers.authSubject, identity.userId)).limit(1);
   if (existing) {
     if (!existing.isActive) throw new Error("Your CRM access is disabled. Please contact an administrator.");
@@ -196,8 +193,7 @@ function visibleClientIds(clients: { id: string }[]) { return clients.map((clien
 export async function GET() {
   try {
     const db = getDb(); const member = await actor(); const elevated = member.role === "admin" || member.role === "manager";
-    await seedImportedDashboards(db);
-    if (elevated) { await dedupeClients(db); await backfillRevenueFields(db); await normalizePipelineStages(db); await backfillConfirmedPipeline(db); await syncImportedTeamNames(db); await syncImportedTeamMembers(db); await dedupeAgreements(db); await ensurePipelineSettings(db); await db.delete(crmVendors).where(eq(crmVendors.vendorName, "Durgesh")); }
+    if (elevated) { await seedImportedDashboards(db); await dedupeClients(db); await backfillRevenueFields(db); await normalizePipelineStages(db); await backfillConfirmedPipeline(db); await syncImportedTeamNames(db); await syncImportedTeamMembers(db); await dedupeAgreements(db); await ensurePipelineSettings(db); await db.delete(crmVendors).where(eq(crmVendors.vendorName, "Durgesh")); }
     const clients = elevated
       ? await db.select().from(crmClients).orderBy(desc(crmClients.createdAt)).limit(200)
       : await db.select().from(crmClients).where(eq(crmClients.ownerMemberId, member.id)).orderBy(desc(crmClients.createdAt)).limit(200);
@@ -219,7 +215,7 @@ export async function GET() {
     void scoped;
     const activeDocuments = documents.filter((doc) => !doc.deletedAt);
     const linkedAgreements = agreements.map((agreement) => { const document = activeDocuments.find((doc) => doc.entityType === "agreement" && doc.entityId === agreement.id); return { ...agreement, documentId: document?.id || "", documentMimeType: document?.mimeType || "", documentName: document?.originalName || "" }; });
-    return Response.json({ member: publicMember(member), clients, revenue, pipeline, calls, meetings, invoices, payments, agreements: linkedAgreements, documents: activeDocuments, vendors, members, teamSummary: importedTeamRoster, pipelineSettings: pipelineSettings[0] || { id: "global", probabilities: JSON.stringify(defaultProbabilities) } });
+    return Response.json({ member, clients, revenue, pipeline, calls, meetings, invoices, payments, agreements: linkedAgreements, documents: activeDocuments, vendors, members, teamSummary: importedTeamRoster, pipelineSettings: pipelineSettings[0] || { id: "global", probabilities: JSON.stringify(defaultProbabilities) } });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not load CRM data." }, { status: 401 });
   }
@@ -369,9 +365,9 @@ export async function POST(request: Request) {
       for (const row of rows) { const key = text(row.clientId || row.clientCode || row.clientName || row.client || row.prospectName); const candidate = availableClients.find((item) => item.id === key || item.clientCode === key || item.legalName.toLowerCase() === key.toLowerCase()); const prospectName = text(row.prospectName) || (candidate ? candidate.legalName : ""); const calledAt = text(row.calledAt); const outcome = text(row.outcome) || "no_answer"; const duplicate = existingCalls.some((call) => (candidate ? call.clientId === candidate.id : call.prospectName.toLowerCase() === prospectName.toLowerCase()) && call.calledAt === calledAt && call.outcome === outcome); if ((!candidate && !prospectName) || !calledAt || duplicate) { skipped.push(key || "invalid row"); continue; } const record = { id: uid(), clientId: candidate?.id || null, prospectName, callerMemberId: member.id, calledAt, outcome, durationSeconds: Math.max(0, Number(row.durationSeconds) || 0), nextFollowUpAt: text(row.nextFollowUpAt), notes: text(row.notes) }; await db.insert(crmColdCalls).values(record); existingCalls.push(record); imported += 1; }
       response = { id, imported, skipped };
     } else if (action === "reset_password") {
-      if (member.role !== "admin" && member.role !== "manager") throw new Error("Only an administrator can reset passwords."); const targetId = text(body.memberId); const temporaryPassword = `Temp-${crypto.randomUUID().slice(0, 8)}`; await db.update(crmMembers).set({ temporaryPassword: await hashPassword(temporaryPassword), forcePasswordChange: true }).where(eq(crmMembers.id, targetId)); response = { id: targetId, tempPassword: temporaryPassword };
+      if (member.role !== "admin" && member.role !== "manager") throw new Error("Only an administrator can reset passwords."); const targetId = text(body.memberId); const temporaryPassword = `Temp-${crypto.randomUUID().slice(0, 8)}`; await db.update(crmMembers).set({ temporaryPassword, forcePasswordChange: true }).where(eq(crmMembers.id, targetId)); response = { id: targetId, tempPassword: temporaryPassword };
     } else if (action === "team_member_add") {
-      const teamName = text(body.teamName); const elevated = member.role === "admin" || member.role === "manager"; const isHead = member.role === "head" && member.teamName === teamName; if (!elevated && !isHead) throw new Error("Only the team head or administrator can add members."); if (!teamName || !text(body.fullName) || !text(body.email)) throw new Error("Name, real email and team are required."); const temporaryPassword = `Temp-${crypto.randomUUID().slice(0, 8)}`; const newMember = { id: uid(), authSubject: `invite:${uid()}`, email: text(body.email), fullName: text(body.fullName), role: text(body.role) === "head" && elevated ? "head" : "staff", teamName, isActive: true, temporaryPassword: await hashPassword(temporaryPassword), forcePasswordChange: true }; await db.insert(crmMembers).values(newMember); response = { id: newMember.id, temporaryPassword };
+      const teamName = text(body.teamName); const elevated = member.role === "admin" || member.role === "manager"; const isHead = member.role === "head" && member.teamName === teamName; if (!elevated && !isHead) throw new Error("Only the team head or administrator can add members."); if (!teamName || !text(body.fullName) || !text(body.email)) throw new Error("Name, real email and team are required."); const newMember = { id: uid(), authSubject: `invite:${uid()}`, email: text(body.email), fullName: text(body.fullName), role: text(body.role) === "head" && elevated ? "head" : "staff", teamName, isActive: true, temporaryPassword: `Temp-${crypto.randomUUID().slice(0, 8)}`, forcePasswordChange: true }; await db.insert(crmMembers).values(newMember); response = { id: newMember.id, temporaryPassword: newMember.temporaryPassword };
     } else if (action === "team_member_remove") {
       const targetId = text(body.memberId); const [target] = await db.select().from(crmMembers).where(eq(crmMembers.id, targetId)).limit(1); if (!target) throw new Error("Team member was not found."); const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && !(member.role === "head" && member.teamName === target.teamName)) throw new Error("Only the team head or administrator can remove members."); if (target.role === "head" && !elevated) throw new Error("A team head cannot remove another team head."); await db.update(crmMembers).set({ isActive: false }).where(eq(crmMembers.id, targetId)); response = { id: targetId };
     } else if (action === "agreement") {
