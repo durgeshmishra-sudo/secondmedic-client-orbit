@@ -236,15 +236,7 @@ export async function POST(request: Request) {
       if (existingNames.some((row) => normalizeClientName(row.legalName) === normalized)) throw new Error("A client with this name already exists. Use the existing client record.");
       const ownerMemberId = member.role === "admin" && text(body.ownerMemberId) ? text(body.ownerMemberId) : member.id;
       const client = { id, clientCode: `CL-${new Date().getFullYear()}-${id.slice(0, 5).toUpperCase()}`, legalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), city: text(body.city), status: text(body.status) || "prospect", ownerMemberId, teamName: text(body.teamName) || member.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || 30), notes: text(body.notes), createdByMemberId: member.id };
-      await db.insert(crmClients).values(client); await activity(id, member.id, "client_created", "client", id, `Client ${legalName} added.`);
-      const startStage = text(body.stage); const startRevenue = rupeesToMinor(body.projectedRevenue);
-      if (["l1", "l2"].includes(startStage)) {
-        const pct = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
-        const pipeId = uid();
-        await db.insert(crmPipelineItems).values({ id: pipeId, clientId: id, title: `${legalName} - opportunity`, ownerMemberId, stage: startStage, probability: defaultProbabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: "", nextAction: "", revenueId: null, invoiceId: null, lostAt: null, lostReason: "" });
-        await activity(id, member.id, "pipeline", "pipeline", pipeId, `Opportunity added at ${startStage.toUpperCase()}.`);
-      }
-      response = { id, client };
+      await db.insert(crmClients).values(client); await activity(id, member.id, "client_created", "client", id, `Client ${legalName} added.`); response = { id, client };
     } else if (action === "client_update") {
       if (!clientId) throw new Error("Client is required.");
       const [existingClient] = await db.select().from(crmClients).where(eq(crmClients.id, clientId)).limit(1);
