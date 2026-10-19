@@ -22,3 +22,24 @@
 .record-modal .crm-form input,.record-modal .crm-form select,.record-modal .crm-form textarea{width:100%;min-width:0;border:1px solid #d5e3e4;border-radius:7px;padding:9px 10px;font:inherit;font-size:12px;background:#fbfdfd}
 .record-modal .crm-form .form-actions,.record-modal .crm-form > .save{position:sticky;bottom:-19px;background:#fff;padding:12px 0 4px;display:flex;gap:10px;justify-content:flex-end;z-index:2}
 @media(max-width:660px){.record-modal .crm-form{grid-template-columns:1fr}}
+
+/* ---- Dashboard: aligned mini tables + daily status ---- */
+.mini-row .sr,.mini-head b:first-child{text-align:center!important;color:#6b7b7d}
+.mini-row span:last-child{text-transform:none}
+.mini-head b,.mini-row span{font-variant-numeric:tabular-nums}
+.mini-total{display:grid;gap:8px;align-items:center;padding:9px 8px;background:#E6F2F3;color:#0E4A50;font-size:12px;border-radius:7px}
+.update-panel.navy>h3{background:linear-gradient(90deg,#0E4A50,#19838A)}
+.update-panel.green>h3{background:linear-gradient(90deg,#19838A,#2FA3A9)}
+.daily-status{margin-top:18px;padding:22px;background:#fff;border:1px solid #d5e3e4;border-radius:16px}
+.daily-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+.daily-head h2{margin:0;font-size:20px;color:#171717}.daily-head p{margin:6px 0 0;color:#6b7b7d;font-size:12px}
+.daily-head .dashboard-month{color:#4a5c5e}.daily-head .dashboard-month input{background:#fff;border:1px solid #d5e3e4;color:#171717}
+.daily-table{overflow-x:auto}
+.daily-row{display:grid;grid-template-columns:44px minmax(150px,1.5fr) minmax(90px,1fr) repeat(6,minmax(78px,.8fr)) minmax(90px,.9fr);gap:8px;align-items:center;min-width:900px;padding:10px 8px;border-bottom:1px solid #e6eeef;font-size:12px;color:#171717}
+.daily-th{background:#E6F2F3;border-radius:8px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:#0E4A50}
+.daily-row .sr{text-align:center;color:#6b7b7d}.daily-th b:first-child{text-align:center}
+.daily-row .num,.daily-th b:nth-child(n+4):nth-child(-n+9){text-align:right;font-variant-numeric:tabular-nums}
+.daily-row .name{font-weight:800}
+.daily-total{background:#F4F8F8;border-bottom:0;border-radius:8px;font-weight:800}
+.daily-note{margin:12px 0 0;color:#6b7b7d;font-size:11px}
+.status-tag.sand{background:#fff3dc;color:#9a6200}
