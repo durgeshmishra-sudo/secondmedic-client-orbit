@@ -55,18 +55,30 @@ export async function ensureLocalAccounts(db: Db) {
   for (const account of localAccounts) {
     const [byId] = await db.select().from(crmMembers).where(eq(crmMembers.id, account.id)).limit(1);
     const [byEmail] = byId ? [byId] : await db.select().from(crmMembers).where(eq(crmMembers.email, account.email)).limit(1);
-    const values = {
+    const profileValues = {
       authSubject: `local:${account.email}`,
       email: account.email,
       fullName: account.fullName,
       role: account.role,
       teamName: account.teamName,
       isActive: true,
-      temporaryPassword: accountPasswordHash(account),
-      forcePasswordChange: false,
     };
-    if (byEmail) await db.update(crmMembers).set(values).where(eq(crmMembers.id, byEmail.id));
-    else await db.insert(crmMembers).values({ id: account.id, ...values });
+    if (byEmail) {
+      // Keep credentials and the password-change flag owned by the account.
+      // The environment hash is only an initial credential for new accounts;
+      // it must never undo a password changed through the CRM.
+      const credentials = byEmail.temporaryPassword
+        ? {}
+        : { temporaryPassword: accountPasswordHash(account), forcePasswordChange: false };
+      await db.update(crmMembers).set({ ...profileValues, ...credentials }).where(eq(crmMembers.id, byEmail.id));
+    } else {
+      await db.insert(crmMembers).values({
+        id: account.id,
+        ...profileValues,
+        temporaryPassword: accountPasswordHash(account),
+        forcePasswordChange: false,
+      });
+    }
   }
 }
 
