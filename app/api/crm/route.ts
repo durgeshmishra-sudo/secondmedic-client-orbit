@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
+import { getLocalSessionMember } from "../../crm-auth";
 import { getDb } from "../../../db";
 import {
   crmActivityEvents, crmAgreements, crmClients, crmColdCalls, crmDocuments,
@@ -174,9 +175,11 @@ async function ensurePipelineSettings(db: ReturnType<typeof getDb>) {
 }
 
 async function actor() {
+  const db = getDb();
+  const localMember = await getLocalSessionMember(db);
+  if (localMember) return localMember;
   const identity = await getChatGPTUser();
   if (!identity) throw new Error("Please sign in with ChatGPT to use the CRM.");
-  const db = getDb();
   const [existing] = await db.select().from(crmMembers).where(eq(crmMembers.authSubject, identity.userId)).limit(1);
   if (existing) {
     if (!existing.isActive) throw new Error("Your CRM access is disabled. Please contact an administrator.");
@@ -235,8 +238,23 @@ export async function POST(request: Request) {
       const existingNames = await db.select({ id: crmClients.id, legalName: crmClients.legalName }).from(crmClients);
       if (existingNames.some((row) => normalizeClientName(row.legalName) === normalized)) throw new Error("A client with this name already exists. Use the existing client record.");
       const ownerMemberId = member.role === "admin" && text(body.ownerMemberId) ? text(body.ownerMemberId) : member.id;
-      const client = { id, clientCode: `CL-${new Date().getFullYear()}-${id.slice(0, 5).toUpperCase()}`, legalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), city: text(body.city), status: text(body.status) || "prospect", ownerMemberId, teamName: text(body.teamName) || member.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || 30), notes: text(body.notes), createdByMemberId: member.id };
-      await db.insert(crmClients).values(client); await activity(id, member.id, "client_created", "client", id, `Client ${legalName} added.`); response = { id, client };
+      const startStage = text(body.stage) || text(body.status) || "prospect";
+      const client = { id, clientCode: `CL-${new Date().getFullYear()}-${id.slice(0, 5).toUpperCase()}`, legalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), segment: text(body.segment), city: text(body.city), status: startStage, leadSource: text(body.leadSource) || "Other", ownerMemberId, teamName: text(body.teamName) || member.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || 30), notes: text(body.notes), createdByMemberId: member.id };
+      await db.insert(crmClients).values(client); await activity(id, member.id, "client_created", "client", id, `Client ${legalName} added.`);
+      const startRevenue = rupeesToMinor(body.projectedRevenue);
+      if (["l1", "l2"].includes(startStage)) {
+        const pct = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
+        const pipeId = uid();
+        await db.insert(crmPipelineItems).values({ id: pipeId, clientId: id, title: `${legalName} - opportunity`, ownerMemberId, stage: startStage, probability: defaultProbabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: "", nextAction: "", revenueId: null, invoiceId: null, lostAt: null, lostReason: "" });
+        await activity(id, member.id, "pipeline", "pipeline", pipeId, `Opportunity added at ${startStage.toUpperCase()}.`);
+      } else if (["l3", "l4", "l5"].includes(startStage)) {
+        const pct = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
+        const month = text(body.revenueMonth) || dateOnly().slice(0, 7);
+        const revenueId = uid();
+        await db.insert(crmRevenueEntries).values({ id: revenueId, clientId: id, ownerMemberId, entryDate: `${month}-01`, revenueMonth: month, revenueMinor: startRevenue, marginMinor: Math.round(startRevenue * pct / 100), projectedRevenueMinor: startRevenue, projectedMarginMinor: Math.round(startRevenue * pct / 100), actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: "Client stage revenue", status: "projected" });
+        await db.insert(crmPipelineItems).values({ id: uid(), clientId: id, title: `${legalName} - ${startStage.toUpperCase()}`, ownerMemberId, stage: startStage, probability: defaultProbabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: text(body.expectedCloseDate), nextAction: "", revenueId, invoiceId: null, lostAt: null, lostReason: "" });
+      }
+      response = { id, client };
     } else if (action === "client_update") {
       if (!clientId) throw new Error("Client is required.");
       const [existingClient] = await db.select().from(crmClients).where(eq(crmClients.id, clientId)).limit(1);
@@ -249,7 +267,7 @@ export async function POST(request: Request) {
       if (duplicate) throw new Error("A client with this name already exists. Use the existing client record.");
       const ownerMemberId = elevated && text(body.ownerMemberId) ? text(body.ownerMemberId) : existingClient.ownerMemberId;
       const nextStatus = text(body.status) || existingClient.status;
-      const client = { legalName: nextLegalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), city: text(body.city), status: nextStatus, ownerMemberId, teamName: elevated ? (text(body.teamName) || existingClient.teamName) : existingClient.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || existingClient.paymentTermsDays || 30), notes: text(body.notes), updatedAt: new Date().toISOString() };
+      const client = { legalName: nextLegalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), segment: text(body.segment), city: text(body.city), status: nextStatus, leadSource: text(body.leadSource) || existingClient.leadSource || "Other", ownerMemberId, teamName: elevated ? (text(body.teamName) || existingClient.teamName) : existingClient.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || existingClient.paymentTermsDays || 30), notes: text(body.notes), updatedAt: new Date().toISOString() };
       await db.update(crmClients).set(client).where(eq(crmClients.id, clientId));
       await activity(clientId, member.id, "client_updated", "client", clientId, `Client ${client.legalName} updated.`); response = { id: clientId, client: { ...existingClient, ...client } };
     } else if (action === "bulk_clients") {
@@ -266,8 +284,16 @@ export async function POST(request: Request) {
       const marginPercent = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
       const projectedMarginMinor = body.projectedMargin ? rupeesToMinor(body.projectedMargin) : Math.round(projectedRevenueMinor * marginPercent / 100);
       const entryDate = text(body.entryDate) || `${revenueMonth}-01`;
-      const record = { id, clientId, ownerMemberId: member.id, entryDate, revenueMonth, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, projectedRevenueMinor, projectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: text(body.description), status: "projected" };
-      await db.insert(crmRevenueEntries).values(record); await activity(clientId, member.id, "revenue", "revenue", id, `Revenue entry recorded for ${record.entryDate}.`); response = { id, record };
+      const [existingRevenue] = await db.select().from(crmRevenueEntries).where(and(eq(crmRevenueEntries.clientId, clientId), eq(crmRevenueEntries.revenueMonth, revenueMonth))).limit(1);
+      if (existingRevenue) {
+        const record = { ...existingRevenue, projectedRevenueMinor, projectedMarginMinor, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, description: text(body.description) || existingRevenue.description };
+        await db.update(crmRevenueEntries).set({ projectedRevenueMinor, projectedMarginMinor, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, description: record.description }).where(eq(crmRevenueEntries.id, existingRevenue.id));
+        response = { id: existingRevenue.id, record, merged: true };
+      } else {
+        const record = { id, clientId, ownerMemberId: member.id, entryDate, revenueMonth, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, projectedRevenueMinor, projectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: text(body.description), status: "projected" };
+        await db.insert(crmRevenueEntries).values(record); response = { id, record };
+      }
+      await activity(clientId, member.id, "revenue", "revenue", String(response.id), `Revenue entry recorded for ${entryDate}.`);
     } else if (action === "revenue_actual_update") {
       const revenueId = text(body.revenueId); if (!revenueId) throw new Error("Revenue record is required.");
       const [existing] = await db.select().from(crmRevenueEntries).where(eq(crmRevenueEntries.id, revenueId)).limit(1);
@@ -331,10 +357,10 @@ export async function POST(request: Request) {
       }
       await activity(clientId, member.id, "payment", "payment", id, `Payment received on ${record.receivedOn}.`); response = { id, record };
     } else if (action === "pipeline_update") {
-      const pipelineId = text(body.pipelineId); const nextStage = text(body.stage); if (!pipelineId || (nextStage !== "lost" && !stages.includes(nextStage))) throw new Error("A valid pipeline item and stage are required.");
+      const pipelineId = text(body.pipelineId); const nextStage = text(body.stage); if (!pipelineId || (nextStage !== "lost" && nextStage !== "on_hold" && !stages.includes(nextStage))) throw new Error("A valid pipeline item and stage are required.");
       const [item] = await db.select().from(crmPipelineItems).where(eq(crmPipelineItems.id, pipelineId)).limit(1); if (!item) throw new Error("Pipeline item was not found.");
       const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && item.ownerMemberId !== member.id) throw new Error("You can only move your own pipeline items.");
-      if (nextStage === "lost") { await db.update(crmPipelineItems).set({ stage: "lost", lostAt: new Date().toISOString(), lostReason: text(body.lostReason), updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); response = { id: item.id }; }
+      if (nextStage === "lost" || nextStage === "on_hold") { await db.update(crmPipelineItems).set({ stage: nextStage, lostAt: nextStage === "lost" ? new Date().toISOString() : null, lostReason: text(body.lostReason), updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); if (item.clientId) await db.update(crmClients).set({ status: nextStage, updatedAt: new Date().toISOString() }).where(eq(crmClients.id, item.clientId)); response = { id: item.id }; }
       else {
         if (["l1", "l2"].includes(nextStage) && item.revenueId) {
           const [linkedRevenue] = await db.select().from(crmRevenueEntries).where(eq(crmRevenueEntries.id, item.revenueId)).limit(1);
@@ -355,10 +381,10 @@ export async function POST(request: Request) {
           if (nextStage === "l5" && !invoiceId) {
             const invoiceDate = text(body.invoiceDate); if (!invoiceDate) throw new Error("Invoice date is required when a deal moves to L5.");
             const [client] = await db.select().from(crmClients).where(eq(crmClients.id, item.clientId)).limit(1); if (!client) throw new Error("Client was not found.");
-            invoiceId = uid(); await db.insert(crmInvoices).values({ id: invoiceId, clientId: item.clientId, invoiceNumber: `AUTO-${item.id.slice(0, 8).toUpperCase()}`, issueDate: invoiceDate, dueDate: addDays(invoiceDate, client.paymentTermsDays || 30), totalMinor: projectedRevenueMinor, status: "sent", notes: `Created from pipeline ${item.title}`, createdByMemberId: member.id });
+            invoiceId = uid(); await db.insert(crmInvoices).values({ id: invoiceId, clientId: item.clientId, invoiceNumber: text(body.invoiceNumber) || `AUTO-${item.id.slice(0, 8).toUpperCase()}`, issueDate: invoiceDate, dueDate: addDays(invoiceDate, client.paymentTermsDays || 30), totalMinor: rupeesToMinor(body.invoiceAmount) || projectedRevenueMinor, status: "sent", notes: `Created from pipeline ${item.title}`, createdByMemberId: member.id });
           }
         }
-        await db.update(crmPipelineItems).set({ stage: nextStage, probability: defaultProbabilities[nextStage], revenueId, invoiceId, lostAt: null, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); response = { id: item.id, revenueId, invoiceId };
+        await db.update(crmPipelineItems).set({ stage: nextStage, probability: defaultProbabilities[nextStage], revenueId, invoiceId, lostAt: null, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); if (item.clientId) await db.update(crmClients).set({ status: nextStage, updatedAt: new Date().toISOString() }).where(eq(crmClients.id, item.clientId)); response = { id: item.id, revenueId, invoiceId };
       }
     } else if (action === "bulk_calls") {
       const rows = Array.isArray(body.rows) ? body.rows as Record<string, unknown>[] : []; if (!rows.length) throw new Error("No call rows were supplied."); const allClients = await db.select().from(crmClients); const elevated = member.role === "admin" || member.role === "manager"; const availableClients = elevated ? allClients : allClients.filter((candidate) => candidate.ownerMemberId === member.id); let imported = 0; const skipped: string[] = []; const existingCalls = await db.select().from(crmColdCalls);
