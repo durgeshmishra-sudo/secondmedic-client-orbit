@@ -1,5 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./dashboard.css";
+import "./mobile.css";
+import "./secondmedic-theme.css";
+import "./secondmedic-responsive.css";
+import "./restored-components.css";
 
 export const metadata: Metadata = {
   title: "Team Performance Portal",
