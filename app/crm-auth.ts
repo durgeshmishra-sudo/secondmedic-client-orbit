@@ -47,8 +47,11 @@ export async function hashPassword(password: string) {
 }
 
 export async function verifyPassword(password: string, stored: string) {
-  if (!stored.startsWith(HASH_PREFIX)) return false;
-  return (await hashPassword(password)) === stored;
+  if (stored.startsWith(HASH_PREFIX)) return (await hashPassword(password)) === stored;
+  // Accept one legacy plain-text temporary password so accounts reset by an
+  // older deployment can still sign in. The auth route immediately upgrades
+  // it to a hash after a successful match.
+  return Boolean(stored) && password === stored;
 }
 
 export async function ensureLocalAccounts(db: Db) {
@@ -97,10 +100,24 @@ async function verifyPayload(payload: string, signature: string, secret: string)
   return crypto.subtle.verify("HMAC", key, fromBase64Url(signature), encoder.encode(payload));
 }
 
+// Session signatures must not depend on a member's editable password. A password
+// change should not invalidate the cookie while it is being set or make the next
+// CRM request fail because another request refreshed the member profile. Prefer a
+// dedicated runtime secret; the admin password hash is the existing deployment
+// secret and is a safe backwards-compatible fallback for installations that have
+// not configured CRM_SESSION_SECRET yet.
+function sessionSecret() {
+  const configured = String(runtimeEnv.CRM_SESSION_SECRET ?? "").trim();
+  if (configured) return configured;
+  const adminHash = String(runtimeEnv.CRM_ADMIN_PASSWORD_HASH ?? "").trim();
+  if (adminHash) return adminHash;
+  return "secondmedic-crm-session-v1";
+}
+
 export async function createSessionCookie(member: Member) {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_MAX_AGE;
   const payload = `${member.id}|${expiresAt}`;
-  const value = `${base64Url(encoder.encode(payload))}.${await signPayload(payload, member.temporaryPassword)}`;
+  const value = `${base64Url(encoder.encode(payload))}.${await signPayload(payload, sessionSecret())}`;
   return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`;
 }
 
@@ -108,8 +125,22 @@ export function clearSessionCookie() {
   return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
-export async function getLocalSessionMember(db: Db): Promise<Member | null> {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+function cookieValue(header: string | null, name: string) {
+  if (!header) return "";
+  for (const part of header.split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return value.join("=");
+  }
+  return "";
+}
+
+export async function getLocalSessionMember(db: Db, request?: Request): Promise<Member | null> {
+  // Cloudflare's request context is the authoritative cookie source. The
+  // Next headers helper can lag behind the Set-Cookie response on a custom
+  // domain, which previously made a successful login look unauthenticated.
+  const token = cookieValue(request?.headers.get("cookie") ?? null, SESSION_COOKIE)
+    || (await cookies()).get(SESSION_COOKIE)?.value
+    || "";
   if (!token) return null;
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
@@ -119,7 +150,11 @@ export async function getLocalSessionMember(db: Db): Promise<Member | null> {
     if (!memberId || Number(expiresAt) < Math.floor(Date.now() / 1000)) return null;
     const [member] = await db.select().from(crmMembers).where(eq(crmMembers.id, memberId)).limit(1);
     if (!member || !member.isActive || !member.temporaryPassword) return null;
-    return await verifyPayload(payload, signature, member.temporaryPassword) ? member : null;
+    // Accept the legacy password-bound signature for already issued cookies, but
+    // use the stable deployment secret for all newly issued sessions.
+    const valid = await verifyPayload(payload, signature, sessionSecret())
+      || await verifyPayload(payload, signature, member.temporaryPassword);
+    return valid ? member : null;
   } catch {
     return null;
   }
