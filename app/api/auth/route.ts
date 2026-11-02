@@ -9,10 +9,10 @@ const json = (body: Record<string, unknown>, status = 200, cookie?: string) => {
   return response;
 };
 
-export async function GET() {
+export async function GET(request: Request) {
   const db = getDb();
   await ensureLocalAccounts(db);
-  const member = await getLocalSessionMember(db);
+  const member = await getLocalSessionMember(db, request);
   return member ? json({ authenticated: true, member: publicMember(member), forcePasswordChange: Boolean(member.forcePasswordChange) }) : json({ authenticated: false }, 401);
 }
 
@@ -29,11 +29,15 @@ export async function POST(request: Request) {
       if (!email || !password) return json({ error: "Email and password are required." }, 400);
       const [member] = await db.select().from(crmMembers).where(eq(crmMembers.email, email)).limit(1);
       if (!member || !member.isActive || !(await verifyPassword(password, member.temporaryPassword))) return json({ error: "Invalid email or password." }, 401);
+      if (!member.temporaryPassword.startsWith("sha256:")) {
+        await db.update(crmMembers).set({ temporaryPassword: await hashPassword(password) }).where(eq(crmMembers.id, member.id));
+        member.temporaryPassword = await hashPassword(password);
+      }
       return json({ ok: true, member: publicMember(member), forcePasswordChange: Boolean(member.forcePasswordChange) }, 200, await createSessionCookie(member));
     }
 
     if (action === "change_password") {
-      const member = await getLocalSessionMember(db);
+      const member = await getLocalSessionMember(db, request);
       const password = typeof body.password === "string" ? body.password : "";
       if (!member) return json({ error: "Your session has expired. Please sign in again." }, 401);
       if (password.length < 8) return json({ error: "Password must be at least 8 characters." }, 400);
