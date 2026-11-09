@@ -1,17 +1,14 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import "./dashboard.css";
-import "./mobile.css";
-import "./secondmedic-theme.css";
-import "./secondmedic-responsive.css";
 import "./restored-components.css";
+import "./workspace-polish.css";
 
 export const metadata: Metadata = {
-  title: "Team Performance Portal",
+  title: "SecondMedic CRM",
   description: "Client, pipeline, visit, invoice and payment tracking for your team.",
   icons: {
-    icon: "/favicon.svg",
-    shortcut: "/favicon.svg",
+    icon: "/favicon.png?v=3",
+    shortcut: "/favicon.png?v=3",
   },
 };
 
