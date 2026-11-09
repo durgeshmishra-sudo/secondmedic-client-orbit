@@ -2,6 +2,8 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { getLocalSessionMember, hashPassword } from "../../crm-auth";
 import { getDb } from "../../../db";
+import { claimCrmWrite, finishCrmWrite, RequestGuardError } from "../../../lib/crm-request-guard";
+import { carryForwardPlan } from "../../../lib/crm-months";
 import {
   crmActivityEvents, crmActivityLog, crmAgreements, crmClients, crmColdCalls, crmDocuments,
   crmInvoices, crmMeetings, crmMembers, crmPayments, crmPipelineItems, crmPipelineSettings, crmRevenueEntries, crmVendors,
@@ -14,10 +16,10 @@ const rupeesToMinor = (value: unknown) => Math.max(0, Math.round((Number(value) 
 const dateOnly = () => new Date().toISOString().slice(0, 10);
 const addDays = (value: string, days: number) => { const date = new Date(value + "T00:00:00"); date.setDate(date.getDate() + days); return date.toISOString().slice(0, 10); };
 const cleanDate = (value: unknown) => { const date = text(value); return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : ""; };
-const cleanVendorStatus = (value: unknown) => { const status = text(value); return ["unpaid", "part_paid", "paid"].includes(status) ? status : "unpaid"; };
+const cleanVendorStatus = (value: unknown) => { const status = text(value); return status === "partially_paid" ? "part_paid" : ["unpaid", "part_paid", "paid"].includes(status) ? status : "unpaid"; };
 const stages = ["l1", "l2", "l3", "l4", "l5"];
 const defaultProbabilities: Record<string, number> = { l1: 20, l2: 50, l3: 100, l4: 100, l5: 100 };
-const leadSources = new Set(["Meta Ads", "Google", "Referral", "Cold call", "LinkedIn", "Walk-in", "Other"]);
+const leadSources = new Set(["Existing client", "Referral", "Broker / TPA", "Corporate outreach", "LinkedIn", "Meta", "Website / WhatsApp", "Camp / event", "Directory", "Other", "Meta Ads", "Google", "Cold call", "Walk-in"]);
 const normalizeClientName = (value: string) => {
   const words = value.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean).filter((word) => word !== "health");
   const normalized = words.join(" ");
@@ -125,14 +127,6 @@ const restoredVendors = [
   ["Sachin Diagnostic", 38000, "2026-12-31", 30], ["Surv Surakhsa", 11000, "2026-12-31", 30], ["Go Simplyfy", 165550, "2026-12-31", 30], ["Anshu Hospital", 644840, "2026-12-31", 30],
 ] as const;
 
-async function restoreVendorsIfEmpty(db: ReturnType<typeof getDb>, memberId: string) {
-  const existing = await db.select({ id: crmVendors.id }).from(crmVendors).limit(1);
-  if (existing.length) return;
-  for (const [vendorName, amount, proposedDate, creditPeriodDays] of restoredVendors) {
-    await db.insert(crmVendors).values({ id: uid(), vendorName, amountMinor: amount * 100, clientId: null, clientIds: "[]", customerType: "direct_customer", directCustomerName: vendorName, clientPayment: "no", vendorPaymentStatus: "unpaid", paymentStatus: "unpaid", proposedDate, creditPeriodDays, invoiceDate: "", dueDate: addDays(proposedDate, creditPeriodDays), ownerMemberId: memberId, notes: "Restored from vendor payable schedule" });
-  }
-}
-
 async function normalizeVendorSchedules(db: ReturnType<typeof getDb>) {
   // Older imports stored the literal placeholder "invoice_date" and copied
   // the scheduled date into due_date.  The CRM rule is unambiguous: due date
@@ -158,7 +152,7 @@ async function removeUnlinkedDemoAssociates(db: ReturnType<typeof getDb>) {
   for (const demo of demoMembers) {
     const [head] = await db.select().from(crmMembers).where(and(eq(crmMembers.teamName, demo.teamName), eq(crmMembers.role, "head"))).limit(1);
     if (!head) { skipped.push({ name: demo.fullName, reason: "No team head found" }); continue; }
-    const [{ clients }, { calls }, { revenue }] = await Promise.all([
+    const [[{ clients }], [{ calls }], [{ revenue }]] = await Promise.all([
       db.select({ clients: sql<number>`count(*)` }).from(crmClients).where(eq(crmClients.ownerMemberId, demo.id)),
       db.select({ calls: sql<number>`count(*)` }).from(crmColdCalls).where(eq(crmColdCalls.callerMemberId, demo.id)),
       db.select({ revenue: sql<number>`count(*)` }).from(crmRevenueEntries).where(eq(crmRevenueEntries.ownerMemberId, demo.id)),
@@ -319,6 +313,11 @@ async function actor(request?: Request) {
 
 function visibleClientIds(clients: { id: string }[]) { return clients.map((client) => client.id); }
 
+function visibleMember<T extends { id: string }>(member: T) {
+  const { temporaryPassword: _credential, ...profile } = member as T & { temporaryPassword?: string };
+  return profile;
+}
+
 // D1/SQLite limits the number of bound variables in a single statement. The
 // admin view can have hundreds of clients, so keep client-scoped reads below
 // that limit while preserving the same records and ordering.
@@ -341,15 +340,13 @@ export async function GET(request: Request) {
     // the sign-in screen immediately instead of waiting for every additive
     // migration/index check to finish.
     const member = await actor(request);
-    await ensureSchemaCached(db);
     const elevated = member.role === "admin" || member.role === "manager"; const teamScoped = member.role === "head";
     const cacheKey = `${member.id}:${member.role}:${member.teamName || ""}`;
-    const cached = crmResponseCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return Response.json(cached.body);
-    if (cached) crmResponseCache.delete(cacheKey);
+    // Records are refreshed after every save. Device-local caching is handled
+    // by the UI; an isolate-local cache cannot invalidate other Worker isolates.
+    void cacheKey;
     const teamMembers = teamScoped ? await db.select({ id: crmMembers.id }).from(crmMembers).where(and(eq(crmMembers.teamName, member.teamName), eq(crmMembers.isActive, true))) : [];
     const teamMemberIds = teamMembers.map((row) => row.id);
-    if (elevated) { await ensurePipelineSettings(db); }
     const clients = elevated
       ? await db.select().from(crmClients).orderBy(desc(crmClients.createdAt)).limit(200)
       : teamScoped && teamMemberIds.length
@@ -368,9 +365,9 @@ export async function GET(request: Request) {
       elevated ? db.select().from(crmDocuments).orderBy(desc(crmDocuments.uploadedAt)).limit(300) : batchByClientIds(ids, (chunk) => db.select().from(crmDocuments).where(inArray(crmDocuments.clientId, chunk)).orderBy(desc(crmDocuments.uploadedAt)).limit(300)),
       elevated ? db.select().from(crmVendors).orderBy(asc(crmVendors.dueDate)).limit(300) : batchByClientIds(ids, (chunk) => db.select().from(crmVendors).where(inArray(crmVendors.clientId, chunk)).orderBy(asc(crmVendors.dueDate)).limit(300)),
       elevated ? db.select().from(crmMembers).orderBy(crmMembers.fullName).limit(100) : teamScoped && teamMemberIds.length ? db.select().from(crmMembers).where(inArray(crmMembers.id, teamMemberIds)).orderBy(crmMembers.fullName).limit(100) : Promise.resolve([member]),
-      elevated ? db.select().from(crmPipelineSettings).where(eq(crmPipelineSettings.id, "global")).limit(1) : Promise.resolve([]),
+      db.select().from(crmPipelineSettings).where(eq(crmPipelineSettings.id, "global")).limit(1),
       elevated ? db.select().from(crmActivityEvents).where(eq(crmActivityEvents.eventType, "daily_booking")).orderBy(desc(crmActivityEvents.occurredAt)).limit(300) : batchByClientIds(ids, (chunk) => db.select().from(crmActivityEvents).where(and(eq(crmActivityEvents.eventType, "daily_booking"), inArray(crmActivityEvents.clientId, chunk))).orderBy(desc(crmActivityEvents.occurredAt)).limit(300)),
-      elevated ? db.select().from(crmActivityLog).orderBy(desc(crmActivityLog.occurredAt)).limit(500) : db.select().from(crmActivityLog).where(eq(crmActivityLog.actorMemberId, member.id)).orderBy(desc(crmActivityLog.occurredAt)).limit(500),
+      elevated ? db.select().from(crmActivityLog).orderBy(desc(crmActivityLog.occurredAt)).limit(500) : teamScoped ? db.select().from(crmActivityLog).where(eq(crmActivityLog.teamName, member.teamName)).orderBy(desc(crmActivityLog.occurredAt)).limit(500) : db.select().from(crmActivityLog).where(eq(crmActivityLog.actorMemberId, member.id)).orderBy(desc(crmActivityLog.occurredAt)).limit(500),
     ]);
     void scoped;
     const activeDocuments = documents.filter((doc) => !doc.deletedAt);
@@ -380,9 +377,8 @@ export async function GET(request: Request) {
     const heads = members.filter((row) => row.role === "head" && row.isActive);
     const teamSummary = heads.map((head) => ({ teamName: head.teamName, head: head.fullName, memberCount: members.filter((row) => row.teamName === head.teamName && row.isActive).length }));
     const visibleLogs = member.role === "admin" || member.role === "manager" ? activityLogs : member.role === "head" ? activityLogs.filter((row) => row.teamName === member.teamName) : activityLogs.filter((row) => row.actorMemberId === member.id);
-    const payload = { member, clients, revenue, pipeline: cleanPipeline, calls, meetings, invoices, payments, dailyBookings, agreements: linkedAgreements, documents: activeDocuments, vendors, members, teamSummary, activityLogs: visibleLogs, pipelineSettings: pipelineSettings[0] || { id: "global", probabilities: JSON.stringify(defaultProbabilities) } };
-    crmResponseCache.set(cacheKey, { expiresAt: Date.now() + CRM_CACHE_TTL_MS, body: payload });
-    return Response.json(payload);
+    const payload = { member: visibleMember(member), clients, revenue, pipeline: cleanPipeline, calls, meetings, invoices, payments, dailyBookings, agreements: linkedAgreements, documents: activeDocuments, vendors, members: members.map(visibleMember), teamSummary, activityLogs: visibleLogs, pipelineSettings: pipelineSettings[0] || { id: "global", probabilities: JSON.stringify(defaultProbabilities) } };
+    return Response.json(payload, { headers: { "cache-control": "private, no-store" } });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not load CRM data." }, { status: 401 });
   }
@@ -392,11 +388,13 @@ async function activity(clientId: string, memberId: string, eventType: string, e
   await getDb().insert(crmActivityEvents).values({ id: uid(), clientId, actorMemberId: memberId, eventType, entityType, entityId, body });
 }
 
-async function logActivity(member: typeof crmMembers.$inferSelect, module: string, action: string, recordType = "", recordId = "", oldValue = "", newValue = "", details = "") {
+type MemberContext = Pick<typeof crmMembers.$inferSelect, "id" | "role" | "teamName" | "fullName">;
+
+async function logActivity(member: MemberContext, module: string, action: string, recordType = "", recordId = "", oldValue = "", newValue = "", details = "") {
   try { await getDb().insert(crmActivityLog).values({ id: uid(), actorMemberId: member.id, actorName: member.fullName, actorRole: member.role, teamName: member.teamName, module, action, recordType, recordId, oldValue, newValue, details }); } catch { /* audit logging must never block a CRM save */ }
 }
 
-async function assignedOwner(db: ReturnType<typeof getDb>, member: typeof crmMembers.$inferSelect, requested: unknown) {
+async function assignedOwner(db: ReturnType<typeof getDb>, member: MemberContext, requested: unknown) {
   const candidateId = text(requested);
   const canAssign = member.role === "admin" || member.role === "manager" || member.role === "head";
   if (!candidateId || !canAssign) return member;
@@ -404,6 +402,37 @@ async function assignedOwner(db: ReturnType<typeof getDb>, member: typeof crmMem
   if (!candidate || !candidate.isActive) throw new Error("Assigned staff member was not found.");
   if (member.role === "head" && candidate.teamName !== member.teamName) throw new Error("You can only assign staff within your team.");
   return candidate;
+}
+
+async function mayManageOwner(db: ReturnType<typeof getDb>, member: MemberContext, ownerId: string | null) {
+  if (["admin", "manager"].includes(member.role) || ownerId === member.id) return true;
+  if (member.role !== "head" || !ownerId) return false;
+  const [owner] = await db.select({ teamName: crmMembers.teamName }).from(crmMembers).where(eq(crmMembers.id, ownerId)).limit(1);
+  return !!owner && owner.teamName === member.teamName;
+}
+
+async function requireClientAccess(db: ReturnType<typeof getDb>, member: MemberContext, clientId: string) {
+  const [client] = await db.select().from(crmClients).where(eq(crmClients.id, clientId)).limit(1);
+  if (!client || !await mayManageOwner(db, member, client.ownerMemberId)) throw new Error("This client is not assigned to you or your team.");
+  return client;
+}
+
+async function stageProbabilities(db: ReturnType<typeof getDb>) {
+  const [settings] = await db.select().from(crmPipelineSettings).where(eq(crmPipelineSettings.id, "global")).limit(1);
+  try {
+    const saved = JSON.parse(settings?.probabilities || "{}");
+    return Object.fromEntries(stages.map((stage) => [stage, Number.isFinite(saved[stage]) ? Math.max(0, Math.min(100, saved[stage])) : defaultProbabilities[stage]]));
+  } catch { return defaultProbabilities; }
+}
+
+async function monthlyRevenue(db: ReturnType<typeof getDb>, pipelineId: string, clientId: string, month: string, linkedId: string | null) {
+  const rows = await db.select().from(crmRevenueEntries).where(and(eq(crmRevenueEntries.clientId, clientId), eq(crmRevenueEntries.revenueMonth, month)));
+  const exact = rows.find((row) => row.pipelineItemId === pipelineId) || rows.find((row) => row.id === linkedId);
+  if (exact) return exact;
+  // Unlinked legacy entries can be matched only when the project is unambiguous.
+  const legacy = rows.filter((row) => !row.pipelineItemId);
+  if (legacy.length > 1) throw new Error("This project has multiple revenue entries for that month. Ask an administrator to select the correct entry.");
+  return legacy[0];
 }
 
 async function recalculateInvoice(db: ReturnType<typeof getDb>, invoiceId: string) {
@@ -414,15 +443,51 @@ async function recalculateInvoice(db: ReturnType<typeof getDb>, invoiceId: strin
 }
 
 export async function POST(request: Request) {
+  let guard: { key: string } | null = null;
+  let writeDb: ReturnType<typeof getDb> | null = null;
   try {
     const body = await request.json() as Record<string, unknown>; const db = getDb();
     // The authenticated workspace always performs the additive schema check on
     // its initial GET. Avoid repeating that many-query migration on every
     // button press; writes should only wait for the requested database change.
     const member = await actor(request); const action = text(body.action);
+    writeDb = db;
+    const claimed = await claimCrmWrite(db.$client, member.id, request.headers.get("Idempotency-Key") || text(body.operationId), body);
+    if (claimed.replay) return Response.json(claimed.replay.body, { status: claimed.replay.status });
+    guard = claimed;
+    const probabilities = await stageProbabilities(db);
     let id = uid(); let clientId = text(body.clientId); let response: Record<string, unknown> = { id };
-    if (action === "client") {
+    if (clientId) await requireClientAccess(db, member, clientId);
+    if (action === "carry_forward_month") {
+      const targetMonth = text(body.targetMonth || body.revenueMonth);
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(targetMonth)) throw new Error("Choose a valid target month.");
+      const [year, month] = targetMonth.split("-").map(Number);
+      const sourceMonth = text(body.sourceMonth) || new Date(Date.UTC(year, month - 2, 1)).toISOString().slice(0, 7);
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(sourceMonth) || sourceMonth >= targetMonth) throw new Error("Source month must be before the target month.");
+      const selected = Array.isArray(body.pipelineIds) ? new Set(body.pipelineIds.map(text).filter(Boolean)) : null;
+      const items = await db.select().from(crmPipelineItems).where(and(inArray(crmPipelineItems.stage, stages), sql`${crmPipelineItems.completedAt} IS NULL`));
+      const scopedItems = [];
+      for (const item of items) if ((!selected || selected.has(item.id)) && await mayManageOwner(db, member, item.ownerMemberId)) scopedItems.push(item);
+      const revenueRows = await db.select().from(crmRevenueEntries).where(sql`${crmRevenueEntries.revenueMonth} <= ${targetMonth}`);
+      const statements = [];
+      const plan = carryForwardPlan(scopedItems, revenueRows, sourceMonth, targetMonth);
+      for (const entry of plan.entries) {
+        await requireClientAccess(db, member, entry.clientId);
+        const value = entry.projectedRevenueMinor, margin = entry.projectedMarginMinor;
+        statements.push(db.$client.prepare("INSERT INTO crm_revenue_entries (id, client_id, pipeline_item_id, owner_member_id, entry_date, revenue_month, revenue_minor, margin_minor, projected_revenue_minor, projected_margin_minor, actual_revenue_minor, actual_margin_minor, description, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'projected') ON CONFLICT(pipeline_item_id, revenue_month) DO NOTHING").bind(uid(), entry.clientId, entry.pipelineItemId, entry.ownerMemberId, `${targetMonth}-01`, targetMonth, value, margin, value, margin, `Carried forward from ${sourceMonth}; project ${entry.pipelineItemId}`));
+      }
+      const results = statements.length ? await db.$client.batch(statements) : [];
+      response = { id, targetMonth, sourceMonth, created: results.reduce((sum, result) => sum + (result.meta.changes || 0), 0), skipped: plan.skipped, activeProjects: scopedItems.length };
+    } else if (action === "pipeline_complete" || action === "pipeline_reopen") {
+      const pipelineId = text(body.pipelineId);
+      const [item] = await db.select().from(crmPipelineItems).where(eq(crmPipelineItems.id, pipelineId)).limit(1);
+      if (!item || !await mayManageOwner(db, member, item.ownerMemberId)) throw new Error("This project is not assigned to you or your team.");
+      const completedAt = action === "pipeline_complete" ? new Date().toISOString() : null;
+      await db.update(crmPipelineItems).set({ completedAt, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id));
+      response = { id: item.id, completedAt };
+    } else if (action === "client") {
       const legalName = text(body.legalName); if (!legalName) throw new Error("Client name is required.");
+      if (!text(body.ownerMemberId) || !text(body.segment) || !leadSources.has(text(body.leadSource))) throw new Error("Select an owner, segment and lead source before saving the client.");
       // Same-name clients are separate projects. Never deduplicate or merge
       // them by display name; each record remains independent by client id.
       const existingProjects = await db.select({ id: crmClients.id }).from(crmClients).where(eq(crmClients.legalName, legalName));
@@ -432,21 +497,21 @@ export async function POST(request: Request) {
       const requestedStage = text(body.stage) || text(body.status);
       const startStage = [...stages, "on_hold", "lost"].includes(requestedStage) ? requestedStage : "l1";
       const requestedLeadSource = text(body.leadSource);
-      const leadSource = leadSources.has(requestedLeadSource) ? requestedLeadSource : "Other";
-      const client = { id, clientCode: `CL-${new Date().getFullYear()}-${id.slice(0, 5).toUpperCase()}`, legalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), segment: text(body.segment), city: text(body.city), status: startStage, leadSource, ownerMemberId, teamName: text(body.teamName) || member.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || 30), notes: text(body.notes), createdByMemberId: member.id };
+      const leadSource = requestedLeadSource;
+      const client = { id, clientCode: `CL-${new Date().getFullYear()}-${id.slice(0, 5).toUpperCase()}`, legalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), segment: text(body.segment), city: text(body.city), status: startStage, leadSource, ownerMemberId, teamName: clientOwner.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || 30), notes: text(body.notes), createdByMemberId: member.id };
       await db.insert(crmClients).values(client); await activity(id, member.id, "client_created", "client", id, `Client ${legalName} added.`);
       const startRevenue = rupeesToMinor(body.projectedRevenue);
       if (["l1", "l2"].includes(startStage)) {
         const pct = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
         const pipeId = uid();
-        await db.insert(crmPipelineItems).values({ id: pipeId, clientId: id, title: `${legalName} - opportunity`, ownerMemberId, stage: startStage, probability: defaultProbabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: "", nextAction: "", revenueId: null, invoiceId: null, lostAt: null, lostReason: "" });
+        await db.insert(crmPipelineItems).values({ id: pipeId, clientId: id, title: legalName, ownerMemberId, stage: startStage, probability: probabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: "", nextAction: "", revenueId: null, invoiceId: null, lostAt: null, lostReason: "" });
         await activity(id, member.id, "pipeline", "pipeline", pipeId, `Opportunity added at ${startStage.toUpperCase()}.`);
       } else if (["l3", "l4", "l5"].includes(startStage)) {
         const pct = Math.max(0, Math.min(100, Number(body.marginPercent) || 0));
         const month = text(body.revenueMonth) || dateOnly().slice(0, 7);
         const revenueId = uid();
         await db.insert(crmRevenueEntries).values({ id: revenueId, clientId: id, ownerMemberId, entryDate: `${month}-01`, revenueMonth: month, revenueMinor: startRevenue, marginMinor: Math.round(startRevenue * pct / 100), projectedRevenueMinor: startRevenue, projectedMarginMinor: Math.round(startRevenue * pct / 100), actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: "Client stage revenue", status: "projected" });
-        await db.insert(crmPipelineItems).values({ id: uid(), clientId: id, title: `${legalName} - ${startStage.toUpperCase()}`, ownerMemberId, stage: startStage, probability: defaultProbabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: text(body.expectedCloseDate), nextAction: "", revenueId, invoiceId: null, lostAt: null, lostReason: "" });
+        await db.insert(crmPipelineItems).values({ id: uid(), clientId: id, title: legalName, ownerMemberId, stage: startStage, probability: probabilities[startStage], expectedRevenueMinor: startRevenue, expectedMarginMinor: Math.round(startRevenue * pct / 100), expectedCloseDate: text(body.expectedCloseDate), nextAction: "", revenueId, invoiceId: null, lostAt: null, lostReason: "" });
       }
       response = { id, client, projectNumber };
     } else if (action === "client_update") {
@@ -460,30 +525,34 @@ export async function POST(request: Request) {
       const nextLegalName = text(body.legalName) || existingClient.legalName;
       const selectedOwner = text(body.ownerMemberId) ? await assignedOwner(db, member, body.ownerMemberId) : null;
       const ownerMemberId = selectedOwner?.id || existingClient.ownerMemberId;
+      if (!ownerMemberId) throw new Error("Select a staff owner for this project before saving.");
       const requestedStage = text(body.stage) || text(body.status);
       const nextStatus = [...stages, "on_hold", "lost"].includes(requestedStage) ? requestedStage : existingClient.status;
       const requestedLeadSource = text(body.leadSource);
       const nextLeadSource = leadSources.has(requestedLeadSource) ? requestedLeadSource : existingClient.leadSource || "Other";
       const projectedRevenueMinor = body.projectedRevenue === undefined || body.projectedRevenue === "" ? null : rupeesToMinor(body.projectedRevenue);
-      const marginPercent = Math.max(0, Math.min(100, Number(body.marginPercent) || 15));
+      const marginPercent = Math.max(0, Math.min(100, body.marginPercent === undefined || body.marginPercent === "" ? 15 : Number(body.marginPercent)));
       const revenueMonth = text(body.revenueMonth) || dateOnly().slice(0, 7);
       const requestedDealId = text(body.dealId);
       const [deal] = requestedDealId
         ? await db.select().from(crmPipelineItems).where(and(eq(crmPipelineItems.id, requestedDealId), eq(crmPipelineItems.clientId, clientId))).limit(1)
         : await db.select().from(crmPipelineItems).where(eq(crmPipelineItems.clientId, clientId)).orderBy(desc(crmPipelineItems.createdAt)).limit(1);
+      if (nextStatus === "lost" && deal && !["l1", "l2", "l3"].includes(deal.stage)) throw new Error("Only L1 to L3 deals can be marked lost.");
       if (nextStatus === "l5" && (!deal || deal.stage !== "l5") && !text(body.invoiceDate)) throw new Error("Invoice date is required when a client moves to L5.");
-      const client = { legalName: nextLegalName, contactName: text(body.contactName), contactEmail: text(body.contactEmail), contactPhone: text(body.contactPhone), industry: text(body.industry), segment: text(body.segment), city: text(body.city), status: nextStatus, leadSource: nextLeadSource, ownerMemberId, teamName: elevated ? (text(body.teamName) || existingClient.teamName) : existingClient.teamName, paymentTermsDays: Math.max(0, Number(body.paymentTermsDays) || existingClient.paymentTermsDays || 30), notes: text(body.notes), updatedAt: new Date().toISOString() };
+      const preserved = (key: "contactName" | "contactEmail" | "contactPhone" | "industry" | "segment" | "city" | "notes") => body[key] === undefined ? existingClient[key] : text(body[key]);
+      if (body.segment !== undefined && !text(body.segment)) throw new Error("Select a segment before saving the client.");
+      if (body.leadSource !== undefined && !leadSources.has(text(body.leadSource))) throw new Error("Select a valid lead source before saving the client.");
+      const client = { legalName: nextLegalName, contactName: preserved("contactName"), contactEmail: preserved("contactEmail"), contactPhone: preserved("contactPhone"), industry: preserved("industry"), segment: preserved("segment"), city: preserved("city"), status: nextStatus, leadSource: nextLeadSource, ownerMemberId, teamName: elevated ? (text(body.teamName) || existingClient.teamName) : existingClient.teamName, paymentTermsDays: body.paymentTermsDays === undefined || body.paymentTermsDays === "" ? existingClient.paymentTermsDays : Math.max(0, Number(body.paymentTermsDays)), notes: preserved("notes"), updatedAt: new Date().toISOString() };
       await db.update(crmClients).set(client).where(eq(crmClients.id, clientId));
       if (deal && nextStatus !== "on_hold" && nextStatus !== "lost") {
         const expectedRevenueMinor = projectedRevenueMinor === null ? deal.expectedRevenueMinor : projectedRevenueMinor;
         const expectedMarginMinor = projectedRevenueMinor === null ? deal.expectedMarginMinor : Math.round(expectedRevenueMinor * marginPercent / 100);
         let revenueId = meaningfulId(deal.revenueId);
         if (["l3", "l4", "l5"].includes(nextStatus)) {
-          const [existingRevenue] = await db.select().from(crmRevenueEntries).where(and(eq(crmRevenueEntries.clientId, clientId), eq(crmRevenueEntries.revenueMonth, revenueMonth))).limit(1);
-          const hadLinkedRevenue = Boolean(revenueId);
-          revenueId = existingRevenue?.id || revenueId || uid();
-          if (existingRevenue || hadLinkedRevenue) await db.update(crmRevenueEntries).set({ projectedRevenueMinor: expectedRevenueMinor, projectedMarginMinor: expectedMarginMinor, revenueMinor: expectedRevenueMinor, marginMinor: expectedMarginMinor, revenueMonth, entryDate: `${revenueMonth}-01` }).where(eq(crmRevenueEntries.id, revenueId));
-          else await db.insert(crmRevenueEntries).values({ id: revenueId, clientId, ownerMemberId, entryDate: `${revenueMonth}-01`, revenueMonth, revenueMinor: expectedRevenueMinor, marginMinor: expectedMarginMinor, projectedRevenueMinor: expectedRevenueMinor, projectedMarginMinor: expectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: "Client stage revenue", status: "projected" });
+          const existingRevenue = await monthlyRevenue(db, deal.id, clientId, revenueMonth, revenueId);
+          revenueId = existingRevenue?.id || uid();
+          if (existingRevenue) await db.update(crmRevenueEntries).set({ projectedRevenueMinor: expectedRevenueMinor, projectedMarginMinor: expectedMarginMinor, revenueMinor: expectedRevenueMinor, marginMinor: expectedMarginMinor, pipelineItemId: deal.id }).where(eq(crmRevenueEntries.id, revenueId));
+          else await db.insert(crmRevenueEntries).values({ id: revenueId, clientId, pipelineItemId: deal.id, ownerMemberId, entryDate: `${revenueMonth}-01`, revenueMonth, revenueMinor: expectedRevenueMinor, marginMinor: expectedMarginMinor, projectedRevenueMinor: expectedRevenueMinor, projectedMarginMinor: expectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: "Client stage revenue", status: "projected" });
         }
         let invoiceId = meaningfulId(deal.invoiceId);
         if (nextStatus === "l5" && deal.stage !== "l5" && !invoiceId) {
@@ -493,11 +562,11 @@ export async function POST(request: Request) {
           invoiceId = existingInvoice?.id || uid();
           if (!existingInvoice) await db.insert(crmInvoices).values({ id: invoiceId, clientId, invoiceNumber: text(body.invoiceNumber) || `AUTO-${deal.id.slice(0, 8).toUpperCase()}`, issueDate: invoiceDate, dueDate: addDays(invoiceDate, existingClient.paymentTermsDays || 30), totalMinor: rupeesToMinor(body.invoiceAmount) || expectedRevenueMinor, status: "sent", notes: `Created from pipeline ${deal.title}`, createdByMemberId: member.id });
         }
-        await db.update(crmPipelineItems).set({ title: `${nextLegalName} - ${nextStatus.toUpperCase()}`, ownerMemberId, stage: nextStatus, probability: defaultProbabilities[nextStatus] || deal.probability, expectedRevenueMinor, expectedMarginMinor, revenueId, invoiceId, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, deal.id));
+        await db.update(crmPipelineItems).set({ title: nextLegalName, ownerMemberId, stage: nextStatus, probability: probabilities[nextStatus] ?? deal.probability, expectedRevenueMinor, expectedMarginMinor, revenueId, invoiceId, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, deal.id));
       } else if (deal) {
         // Keep the client and its selected deal on the same stage, including
         // On hold and Lost. No new revenue is created for either state.
-        await db.update(crmPipelineItems).set({ title: `${nextLegalName} - ${nextStatus.toUpperCase()}`, stage: nextStatus, probability: defaultProbabilities[nextStatus] || deal.probability, lostAt: nextStatus === "lost" ? new Date().toISOString() : null, lostReason: text(body.lostReason), updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, deal.id));
+        await db.update(crmPipelineItems).set({ title: nextLegalName, stage: nextStatus, probability: probabilities[nextStatus] ?? deal.probability, lostAt: nextStatus === "lost" ? new Date().toISOString() : null, lostReason: text(body.lostReason), updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, deal.id));
       } else if (nextStatus !== "on_hold" && nextStatus !== "lost") {
         // A client can be created/imported without a deal. Saving its stage
         // must still make it visible on the Pipeline board and, from L3 on,
@@ -514,13 +583,12 @@ export async function POST(request: Request) {
           invoiceId = uid();
           await db.insert(crmInvoices).values({ id: invoiceId, clientId, invoiceNumber: text(body.invoiceNumber) || `AUTO-${clientId.slice(0, 8).toUpperCase()}`, issueDate: text(body.invoiceDate), dueDate: addDays(text(body.invoiceDate), existingClient.paymentTermsDays || 30), totalMinor: rupeesToMinor(body.invoiceAmount) || expectedRevenueMinor, status: "sent", notes: "Created from client stage L5", createdByMemberId: member.id });
         }
-        await db.insert(crmPipelineItems).values({ id: uid(), clientId, title: `${nextLegalName} - ${nextStatus.toUpperCase()}`, ownerMemberId, stage: nextStatus, probability: defaultProbabilities[nextStatus], expectedRevenueMinor, expectedMarginMinor, expectedCloseDate: text(body.expectedCloseDate), nextAction: "", revenueId, invoiceId, lostAt: null, lostReason: "" });
+        await db.insert(crmPipelineItems).values({ id: uid(), clientId, title: nextLegalName, ownerMemberId, stage: nextStatus, probability: probabilities[nextStatus], expectedRevenueMinor, expectedMarginMinor, expectedCloseDate: text(body.expectedCloseDate), nextAction: "", revenueId, invoiceId, lostAt: null, lostReason: "" });
       }
       await activity(clientId, member.id, "client_updated", "client", clientId, `Client ${client.legalName} updated.`); response = { id: clientId, client: { ...existingClient, ...client } };
     } else if (action === "bulk_clients") {
       const csv = text(body.csv); if (!csv) throw new Error("Client CSV is empty.");
-      const ownerMemberId = member.role === "admin" && text(body.ownerMemberId) ? text(body.ownerMemberId) : member.id;
-      const owner = ownerMemberId ? (await db.select().from(crmMembers).where(eq(crmMembers.id, ownerMemberId)).limit(1))[0] : member;
+      const owner = await assignedOwner(db, member, body.ownerMemberId);
       if (!owner) throw new Error("Assigned staff member was not found.");
       const rows = parseCsv(csv); let imported = 0; const skipped: string[] = [];
       for (const row of rows) { const legalName = text(row.legalName || row.clientName || row.name); if (!legalName) continue; const rowId = uid(); await db.insert(crmClients).values({ id: rowId, clientCode: text(row.clientCode) || `CL-${new Date().getFullYear()}-${rowId.slice(0, 5).toUpperCase()}`, legalName, contactName: text(row.contactName), contactEmail: text(row.contactEmail), contactPhone: text(row.contactPhone), industry: text(row.industry), city: text(row.city), status: text(row.status) || "prospect", ownerMemberId: owner.id, teamName: text(row.teamName) || owner.teamName, paymentTermsDays: Math.max(0, Number(row.paymentTermsDays) || 30), notes: text(row.notes), createdByMemberId: member.id }); imported += 1; }
@@ -594,7 +662,7 @@ export async function POST(request: Request) {
           title: legalName,
           ownerMemberId: owner.id,
           stage: stageValue,
-          probability: defaultProbabilities[stageValue],
+          probability: probabilities[stageValue],
           expectedRevenueMinor,
           expectedMarginMinor,
           expectedCloseDate: cleanDate(row.expectedCloseDate),
@@ -632,8 +700,8 @@ export async function POST(request: Request) {
       const revenueId = text(body.revenueId); if (!revenueId) throw new Error("Revenue record is required.");
       const [existing] = await db.select().from(crmRevenueEntries).where(eq(crmRevenueEntries.id, revenueId)).limit(1);
       if (!existing) throw new Error("Revenue record was not found.");
-      const elevated = member.role === "admin" || member.role === "manager";
-      if (!elevated && existing.ownerMemberId !== member.id) throw new Error("You can only update your own revenue records.");
+      if (!await mayManageOwner(db, member, existing.ownerMemberId)) throw new Error("You can only update revenue assigned to you or your team.");
+      await requireClientAccess(db, member, existing.clientId);
       const actualRevenueMinor = rupeesToMinor(body.actualRevenue);
       const projectedRevenueMinor = existing.projectedRevenueMinor || existing.revenueMinor || 0;
       const projectedMarginMinor = existing.projectedMarginMinor || existing.marginMinor || 0;
@@ -647,7 +715,7 @@ export async function POST(request: Request) {
       const pipelineOwner = await assignedOwner(db, member, body.ownerMemberId);
       const [pipelineClient] = await db.select().from(crmClients).where(eq(crmClients.id, clientId)).limit(1);
       const title = text(body.title) || (pipelineClient ? `${pipelineClient.legalName} - ${stage.toUpperCase()}` : "Opportunity");
-      const record = { id, clientId: clientId || null, title, ownerMemberId: pipelineOwner.id, stage, probability: defaultProbabilities[stage], expectedRevenueMinor: rupeesToMinor(body.expectedRevenue), expectedMarginMinor: rupeesToMinor(body.expectedMargin), expectedCloseDate: text(body.expectedCloseDate), nextAction: text(body.nextAction), revenueId: null, invoiceId: null, lostAt: null, lostReason: "" };
+      const record = { id, clientId: clientId || null, title, ownerMemberId: pipelineOwner.id, stage, probability: probabilities[stage], expectedRevenueMinor: rupeesToMinor(body.expectedRevenue), expectedMarginMinor: rupeesToMinor(body.expectedMargin), expectedCloseDate: text(body.expectedCloseDate), nextAction: text(body.nextAction), revenueId: null, invoiceId: null, lostAt: null, lostReason: "" };
       await db.insert(crmPipelineItems).values(record); if (clientId) await activity(clientId, member.id, "pipeline", "pipeline", id, `Opportunity ${record.title} added.`); response = { id, record };
     } else if (action === "call") {
       if (!text(body.prospectName) && !clientId) throw new Error("Choose a client or enter a prospect name.");
@@ -668,7 +736,8 @@ export async function POST(request: Request) {
     } else if (action === "invoice_update") {
       const invoiceId = text(body.invoiceId); if (!invoiceId) throw new Error("Invoice is required.");
       const [existingInvoice] = await db.select().from(crmInvoices).where(eq(crmInvoices.id, invoiceId)).limit(1); if (!existingInvoice) throw new Error("Invoice was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingInvoice.createdByMemberId !== member.id) throw new Error("You can only edit your own invoices.");
+      if (!await mayManageOwner(db, member, existingInvoice.createdByMemberId)) throw new Error("You can only edit invoices assigned to you or your team.");
+      await requireClientAccess(db, member, existingInvoice.clientId);
       const invoiceNumber = text(body.invoiceNumber) || existingInvoice.invoiceNumber;
       const [duplicateInvoice] = await db.select({ id: crmInvoices.id }).from(crmInvoices).where(and(eq(crmInvoices.invoiceNumber, invoiceNumber), sql`${crmInvoices.id} <> ${invoiceId}`)).limit(1); if (duplicateInvoice) throw new Error("Invoice number already exists. Use a unique invoice number.");
       const issueDate = cleanDate(body.issueDate) || existingInvoice.issueDate; const dueDate = cleanDate(body.dueDate) || existingInvoice.dueDate;
@@ -700,7 +769,7 @@ export async function POST(request: Request) {
       response = { id: invoiceId, deleted: true };
     } else if (action === "bulk_invoices") {
       const csv = text(body.csv); if (!csv) throw new Error("Invoice CSV is empty.");
-      const rows = parseCsv(csv); const allClients = await db.select().from(crmClients); const allMembers = await db.select().from(crmMembers); const elevated = member.role === "admin" || member.role === "manager"; const availableClients = elevated ? allClients : allClients.filter((candidate) => candidate.ownerMemberId === member.id); let imported = 0; let createdClients = 0; const skipped: string[] = []; const existingNumbers = new Set((await db.select({ invoiceNumber: crmInvoices.invoiceNumber }).from(crmInvoices)).map((row) => row.invoiceNumber.trim()));
+      const rows = parseCsv(csv); const allClients = await db.select().from(crmClients); const allMembers = await db.select().from(crmMembers); const elevated = member.role === "admin" || member.role === "manager"; const availableClients = elevated ? allClients : allClients.filter((candidate) => candidate.ownerMemberId === member.id || (member.role === "head" && candidate.teamName === member.teamName)); let imported = 0; let createdClients = 0; const skipped: string[] = []; const existingNumbers = new Set((await db.select({ invoiceNumber: crmInvoices.invoiceNumber }).from(crmInvoices)).map((row) => row.invoiceNumber.trim()));
       const normalizeImportName = (value: string) => value.toLowerCase().normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "").replace(/[^a-z0-9]/g, "");
       const aliases: Record<string, string> = { healthiummedtechlimited: "healthiummedtech", ericsoninsurancetpaprivatelimited: "ericsson", iffcotokio: "iffcotokio", healthindia: "healthindia", thetransformation: "transformationgym", ohchealthcare: "ohc", unitedbreweriesltd: "unitedbrewerieslimited", balloonhealthcare: "balloon" };
       const canonicalImportName = (value: string) => aliases[normalizeImportName(value)] || normalizeImportName(value);
@@ -712,11 +781,12 @@ export async function POST(request: Request) {
       for (const row of rows) {
         const key = text(row.clientId || row.clientCode || row.clientName || row.client || row.company); const invoiceNumber = text(row.invoiceNumber || row.invoice); if (!key || !invoiceNumber) { skipped.push(key || "unknown client"); continue; }
         if (existingNumbers.has(invoiceNumber)) { skipped.push(`${invoiceNumber} (duplicate)`); continue; }
-        const owner = resolveOwner(text(row.ownerName || row.owner || row.creator || row.creater));
+        const owner = await assignedOwner(db, member, resolveOwner(text(row.ownerName || row.owner || row.creator || row.creater)).id);
         const normalized = canonicalImportName(key);
-        let client = availableClients.find((candidate) => candidate.id === key || candidate.clientCode === key || candidate.legalName.toLowerCase() === key.toLowerCase());
+        let client = availableClients.find((candidate) => candidate.id === key || candidate.clientCode === key);
         if (!client) {
           const candidates = availableClients.filter((candidate) => canonicalImportName(candidate.legalName) === normalized);
+          if (candidates.length > 1) { skipped.push(`${invoiceNumber}: multiple projects have that name; supply the client ID or code`); continue; }
           if (candidates.length === 1) client = candidates[0];
         }
         if (!client) {
@@ -731,30 +801,34 @@ export async function POST(request: Request) {
     } else if (action === "vendor") {
       if (!text(body.vendorName)) throw new Error("Vendor name is required.");
       const selectedIds = Array.isArray(body.clientIds) ? (body.clientIds as unknown[]).map(text).filter(Boolean) : (clientId ? [clientId] : []);
+      if (!selectedIds.length) throw new Error("This database requires a linked client for vendor payables. Direct-customer linkage needs a reviewed database migration.");
+      for (const linkedId of selectedIds) await requireClientAccess(db, member, linkedId);
       const proposedDate = cleanDate(body.proposedDate || body.dueDate);
       const creditPeriodDays = Math.max(0, Number(body.creditPeriodDays) || 0);
       const paymentStatus = cleanVendorStatus(body.paymentStatus || body.vendorPaymentStatus);
-      const staffMemberId = (member.role === "admin" || member.role === "manager") && text(body.staffMemberId) ? text(body.staffMemberId) : member.id;
-      const record = { id, vendorName: text(body.vendorName), amountMinor: rupeesToMinor(body.amount), clientId: selectedIds[0] || null, clientIds: JSON.stringify(selectedIds), customerType: selectedIds.length ? "linked_client" : "direct_customer", directCustomerName: text(body.directCustomerName) || (selectedIds.length ? "" : text(body.vendorName)), clientPayment: selectedIds.length ? "no" : "no", vendorPaymentStatus: paymentStatus, paymentStatus, proposedDate, creditPeriodDays, invoiceDate: cleanDate(body.invoiceDate), dueDate: proposedDate ? addDays(proposedDate, creditPeriodDays) : "", ownerMemberId: member.id, staffMemberId, notes: text(body.notes) };
+      const staffMemberId = text(body.staffMemberId) ? (await assignedOwner(db, member, body.staffMemberId)).id : null;
+      const record = { id, vendorName: text(body.vendorName), amountMinor: rupeesToMinor(body.amount), clientId: selectedIds[0], clientIds: JSON.stringify(selectedIds), customerType: "linked_client", directCustomerName: text(body.directCustomerName), clientPayment: "no", vendorPaymentStatus: paymentStatus, paymentStatus, proposedDate, creditPeriodDays, invoiceDate: cleanDate(body.invoiceDate), dueDate: proposedDate ? addDays(proposedDate, creditPeriodDays) : "", ownerMemberId: member.id, staffMemberId, notes: text(body.notes) };
       await db.insert(crmVendors).values(record); if (selectedIds[0]) await activity(selectedIds[0], member.id, "vendor", "vendor", id, `Vendor ${record.vendorName} added.`); response = { id, record };
     } else if (action === "vendor_update") {
       const vendorId = text(body.vendorId); if (!vendorId) throw new Error("Vendor payable is required.");
       const [existingVendor] = await db.select().from(crmVendors).where(eq(crmVendors.id, vendorId)).limit(1); if (!existingVendor) throw new Error("Vendor payable was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingVendor.ownerMemberId !== member.id) throw new Error("You can only edit your own vendor payables.");
+      if (!await mayManageOwner(db, member, existingVendor.staffMemberId || existingVendor.ownerMemberId)) throw new Error("You can only edit vendor payables assigned to you or your team.");
       let previousIds: string[] = [];
       try { const parsed = JSON.parse(existingVendor.clientIds || "[]"); if (Array.isArray(parsed)) previousIds = parsed.map(String).filter(Boolean); } catch { if (existingVendor.clientId) previousIds = [existingVendor.clientId]; }
       const selectedIds = Array.isArray(body.clientIds) ? (body.clientIds as unknown[]).map(text).filter(Boolean) : (text(body.clientId) ? [text(body.clientId)] : previousIds);
+      if (!selectedIds.length) throw new Error("This database requires a linked client for vendor payables. Direct-customer linkage needs a reviewed database migration.");
+      for (const linkedId of selectedIds) await requireClientAccess(db, member, linkedId);
       const proposedDate = cleanDate(body.proposedDate || body.dueDate) || existingVendor.proposedDate;
       const creditPeriodDays = Math.max(0, Number(body.creditPeriodDays) || existingVendor.creditPeriodDays || 0);
       const paymentStatus = cleanVendorStatus(body.paymentStatus || body.vendorPaymentStatus || existingVendor.paymentStatus || existingVendor.vendorPaymentStatus);
       const suppliedInvoiceDate = body.invoiceDate === null || body.invoiceDate === undefined ? existingVendor.invoiceDate : cleanDate(body.invoiceDate);
-      const staffMemberId = (member.role === "admin" || member.role === "manager") && text(body.staffMemberId) ? text(body.staffMemberId) : (existingVendor.staffMemberId || member.id);
-      const changes = { vendorName: text(body.vendorName) || existingVendor.vendorName, amountMinor: body.amount === undefined || body.amount === "" ? existingVendor.amountMinor : rupeesToMinor(body.amount), clientId: selectedIds[0] || null, clientIds: JSON.stringify(selectedIds), customerType: selectedIds.length ? "linked_client" : "direct_customer", directCustomerName: text(body.directCustomerName) || (selectedIds.length ? "" : existingVendor.directCustomerName || text(body.vendorName)), proposedDate, creditPeriodDays, invoiceDate: suppliedInvoiceDate === "invoice_date" ? "" : suppliedInvoiceDate, dueDate: proposedDate ? addDays(proposedDate, creditPeriodDays) : "", vendorPaymentStatus: paymentStatus, paymentStatus, staffMemberId, notes: text(body.notes) };
+      const staffMemberId = body.staffMemberId === undefined ? existingVendor.staffMemberId : text(body.staffMemberId) ? (await assignedOwner(db, member, body.staffMemberId)).id : null;
+      const changes = { vendorName: text(body.vendorName) || existingVendor.vendorName, amountMinor: body.amount === undefined || body.amount === "" ? existingVendor.amountMinor : rupeesToMinor(body.amount), clientId: selectedIds[0], clientIds: JSON.stringify(selectedIds), customerType: "linked_client", directCustomerName: text(body.directCustomerName) || existingVendor.directCustomerName, proposedDate, creditPeriodDays, invoiceDate: suppliedInvoiceDate === "invoice_date" ? "" : suppliedInvoiceDate, dueDate: proposedDate ? addDays(proposedDate, creditPeriodDays) : "", vendorPaymentStatus: paymentStatus, paymentStatus, staffMemberId, notes: text(body.notes) };
       await db.update(crmVendors).set(changes).where(eq(crmVendors.id, vendorId)); response = { id: vendorId, record: { ...existingVendor, ...changes } };
     } else if (action === "vendor_status_update") {
       const vendorId = text(body.vendorId); if (!vendorId) throw new Error("Vendor payable is required.");
       const [existingVendor] = await db.select().from(crmVendors).where(eq(crmVendors.id, vendorId)).limit(1); if (!existingVendor) throw new Error("Vendor payable was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingVendor.ownerMemberId !== member.id) throw new Error("You can only update your own vendor payables.");
+      if (!await mayManageOwner(db, member, existingVendor.staffMemberId || existingVendor.ownerMemberId)) throw new Error("You can only update vendor payables assigned to you or your team.");
       const paymentStatus = cleanVendorStatus(body.paymentStatus || body.vendorPaymentStatus);
       await db.update(crmVendors).set({ paymentStatus, vendorPaymentStatus: paymentStatus }).where(eq(crmVendors.id, vendorId));
       response = { id: vendorId, paymentStatus };
@@ -765,10 +839,12 @@ export async function POST(request: Request) {
       response = { id, record: { id, clientId, actorMemberId: member.id, occurredAt: new Date().toISOString(), body: JSON.stringify(payload) } };
     } else if (action === "payment") {
       const invoiceId = text(body.invoiceId); if (!invoiceId || !clientId || !text(body.receivedOn)) throw new Error("Client, invoice and received date are required.");
+      const [invoice] = await db.select().from(crmInvoices).where(eq(crmInvoices.id, invoiceId)).limit(1);
+      if (!invoice || invoice.clientId !== clientId) throw new Error("The invoice does not belong to the selected client.");
+      await requireClientAccess(db, member, invoice.clientId);
       const record = { id, invoiceId, clientId, receivedOn: text(body.receivedOn), amountMinor: rupeesToMinor(body.amount), method: text(body.method) || "bank_transfer", referenceNo: text(body.referenceNo), notes: text(body.notes), recordedByMemberId: member.id };
       if (record.amountMinor <= 0) throw new Error("Payment amount must be greater than zero.");
       await db.insert(crmPayments).values(record);
-      const [invoice] = await db.select().from(crmInvoices).where(eq(crmInvoices.id, invoiceId)).limit(1);
       const linkedPipelines = await db.select().from(crmPipelineItems).where(and(eq(crmPipelineItems.clientId, clientId), eq(crmPipelineItems.invoiceId, invoiceId)));
       const linkedRevenueIds = linkedPipelines.map((item) => meaningfulId(item.revenueId)).filter(Boolean) as string[];
       const revenueRows = linkedRevenueIds.length ? await db.select().from(crmRevenueEntries).where(inArray(crmRevenueEntries.id, linkedRevenueIds)) : await db.select().from(crmRevenueEntries).where(and(eq(crmRevenueEntries.clientId, clientId), eq(crmRevenueEntries.revenueMonth, record.receivedOn.slice(0, 7))));
@@ -787,13 +863,15 @@ export async function POST(request: Request) {
     } else if (action === "payment_update") {
       const paymentId = text(body.paymentId); if (!paymentId) throw new Error("Payment entry is required.");
       const [existingPayment] = await db.select().from(crmPayments).where(eq(crmPayments.id, paymentId)).limit(1); if (!existingPayment) throw new Error("Payment entry was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingPayment.recordedByMemberId !== member.id) throw new Error("You can only edit your own payment entries.");
+      if (!await mayManageOwner(db, member, existingPayment.recordedByMemberId)) throw new Error("You can only edit payment entries recorded by you or your team.");
+      await requireClientAccess(db, member, existingPayment.clientId);
       const changes = { receivedOn: text(body.receivedOn) || existingPayment.receivedOn, revenueMonth: text(body.revenueMonth) || existingPayment.revenueMonth || text(body.receivedOn).slice(0, 7), amountMinor: body.amount === undefined || body.amount === "" ? existingPayment.amountMinor : rupeesToMinor(body.amount), tdsMinor: body.tds === undefined || body.tds === "" ? existingPayment.tdsMinor : rupeesToMinor(body.tds), method: text(body.method) || existingPayment.method, referenceNo: text(body.referenceNo), notes: text(body.notes) };
       await db.update(crmPayments).set(changes).where(eq(crmPayments.id, paymentId)); await recalculateInvoice(db, existingPayment.invoiceId); response = { id: paymentId, record: { ...existingPayment, ...changes } };
     } else if (action === "payment_delete") {
       const paymentId = text(body.paymentId); if (!paymentId) throw new Error("Payment entry is required.");
       const [existingPayment] = await db.select().from(crmPayments).where(eq(crmPayments.id, paymentId)).limit(1); if (!existingPayment) throw new Error("Payment entry was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingPayment.recordedByMemberId !== member.id) throw new Error("You can only delete your own payment entries.");
+      if (!await mayManageOwner(db, member, existingPayment.recordedByMemberId)) throw new Error("You can only delete payment entries recorded by you or your team.");
+      await requireClientAccess(db, member, existingPayment.clientId);
       await db.delete(crmPayments).where(eq(crmPayments.id, paymentId)); await recalculateInvoice(db, existingPayment.invoiceId); response = { id: paymentId };
     } else if (action === "create_missing_revenue") {
       if (member.role !== "admin" && member.role !== "manager") throw new Error("Only an admin can create a missing revenue record.");
@@ -820,6 +898,7 @@ export async function POST(request: Request) {
       const owner = (await db.select({ teamName: crmMembers.teamName }).from(crmMembers).where(eq(crmMembers.id, item.ownerMemberId)).limit(1))[0];
       const withinTeam = member.role === "head" && owner?.teamName === member.teamName;
       if (!elevated && !withinTeam && item.ownerMemberId !== member.id) throw new Error("You can only move pipeline items assigned to you or your team.");
+      if (item.clientId) await requireClientAccess(db, member, item.clientId);
       if (nextStage === "lost" || nextStage === "on_hold") {
         if (nextStage === "lost" && !["l1", "l2", "l3"].includes(item.stage)) throw new Error("Only L1 to L3 deals can be marked lost.");
         await db.update(crmPipelineItems).set({ stage: nextStage, lostAt: nextStage === "lost" ? new Date().toISOString() : null, lostReason: text(body.lostReason), updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); if (item.clientId) await db.update(crmClients).set({ status: nextStage, updatedAt: new Date().toISOString() }).where(eq(crmClients.id, item.clientId)); response = { id: item.id };
@@ -829,41 +908,52 @@ export async function POST(request: Request) {
         if (["l1", "l2"].includes(nextStage) && storedRevenueId) {
           const [linkedRevenue] = await db.select().from(crmRevenueEntries).where(eq(crmRevenueEntries.id, storedRevenueId)).limit(1);
           if (linkedRevenue?.actualRevenueMinor && linkedRevenue.actualRevenueMinor > 0) throw new Error("This deal has actual revenue and cannot move back to L1 or L2.");
-          await db.delete(crmRevenueEntries).where(eq(crmRevenueEntries.id, storedRevenueId));
+          // Stage corrections retain every historical revenue record.
         }
         let revenueId = storedRevenueId; let invoiceId = meaningfulId(item.invoiceId);
-        if (["l1", "l2"].includes(nextStage)) revenueId = null;
         if (["l3", "l4", "l5"].includes(nextStage) && item.clientId) {
           const month = text(body.revenueMonth) || item.expectedCloseDate.slice(0, 7) || dateOnly().slice(0, 7);
           const projectedRevenueMinor = item.expectedRevenueMinor || 0; const projectedMarginMinor = item.expectedMarginMinor || 0;
-          if (revenueId) await db.update(crmRevenueEntries).set({ projectedRevenueMinor, projectedMarginMinor, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, revenueMonth: month, entryDate: `${month}-01` }).where(eq(crmRevenueEntries.id, revenueId));
-          else {
-            const description = `Auto-created from pipeline ${item.id}`; const [existingRevenue] = await db.select().from(crmRevenueEntries).where(eq(crmRevenueEntries.description, description)).limit(1);
-            revenueId = existingRevenue?.id || uid();
-            if (!existingRevenue) await db.insert(crmRevenueEntries).values({ id: revenueId, clientId: item.clientId, ownerMemberId: item.ownerMemberId, entryDate: `${month}-01`, revenueMonth: month, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, projectedRevenueMinor, projectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description, status: "projected" });
-          }
+          const existingRevenue = await monthlyRevenue(db, item.id, item.clientId, month, revenueId);
+          revenueId = existingRevenue?.id || uid();
+          if (existingRevenue) await db.update(crmRevenueEntries).set({ projectedRevenueMinor, projectedMarginMinor, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, pipelineItemId: item.id }).where(eq(crmRevenueEntries.id, revenueId));
+          else await db.insert(crmRevenueEntries).values({ id: revenueId, clientId: item.clientId, pipelineItemId: item.id, ownerMemberId: item.ownerMemberId, entryDate: `${month}-01`, revenueMonth: month, revenueMinor: projectedRevenueMinor, marginMinor: projectedMarginMinor, projectedRevenueMinor, projectedMarginMinor, actualRevenueMinor: null, actualMarginMinor: null, actualUpdatedByMemberId: null, actualUpdatedAt: null, description: `Auto-created from pipeline ${item.id}`, status: "projected" });
           if (nextStage === "l5" && !invoiceId) {
             const invoiceDate = text(body.invoiceDate); if (!invoiceDate) throw new Error("Invoice date is required when a deal moves to L5.");
             const [client] = await db.select().from(crmClients).where(eq(crmClients.id, item.clientId)).limit(1); if (!client) throw new Error("Client was not found.");
             invoiceId = uid(); await db.insert(crmInvoices).values({ id: invoiceId, clientId: item.clientId, invoiceNumber: text(body.invoiceNumber) || `AUTO-${item.id.slice(0, 8).toUpperCase()}`, issueDate: invoiceDate, dueDate: addDays(invoiceDate, client.paymentTermsDays || 30), totalMinor: rupeesToMinor(body.invoiceAmount) || projectedRevenueMinor, status: "sent", notes: `Created from pipeline ${item.title}`, createdByMemberId: member.id });
           }
         }
-        await db.update(crmPipelineItems).set({ stage: nextStage, probability: defaultProbabilities[nextStage], revenueId, invoiceId, lostAt: null, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); if (item.clientId) await db.update(crmClients).set({ status: nextStage, updatedAt: new Date().toISOString() }).where(eq(crmClients.id, item.clientId)); response = { id: item.id, revenueId, invoiceId };
+        await db.update(crmPipelineItems).set({ stage: nextStage, probability: probabilities[nextStage], revenueId, invoiceId, lostAt: null, updatedAt: new Date().toISOString() }).where(eq(crmPipelineItems.id, item.id)); if (item.clientId) await db.update(crmClients).set({ status: nextStage, updatedAt: new Date().toISOString() }).where(eq(crmClients.id, item.clientId)); response = { id: item.id, revenueId, invoiceId };
       }
     } else if (action === "meeting_update") {
       const meetingId = text(body.meetingId); if (!meetingId) throw new Error("Meeting is required.");
       const [existingMeeting] = await db.select().from(crmMeetings).where(eq(crmMeetings.id, meetingId)).limit(1); if (!existingMeeting) throw new Error("Meeting was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingMeeting.organizerMemberId !== member.id) throw new Error("You can only edit your own meetings.");
+      if (!await mayManageOwner(db, member, existingMeeting.organizerMemberId)) throw new Error("You can only edit meetings assigned to you or your team.");
+      if (existingMeeting.clientId) await requireClientAccess(db, member, existingMeeting.clientId);
       const changes = { clientId: text(body.clientId) || existingMeeting.clientId, title: text(body.title) || existingMeeting.title, attendeeName: text(body.attendeeName), scheduledAt: text(body.scheduledAt) || existingMeeting.scheduledAt, durationMinutes: Math.max(15, Number(body.durationMinutes) || existingMeeting.durationMinutes), mode: text(body.mode) || existingMeeting.mode, locationOrLink: text(body.locationOrLink), agenda: text(body.agenda) };
       await db.update(crmMeetings).set(changes).where(eq(crmMeetings.id, meetingId)); response = { id: meetingId, record: { ...existingMeeting, ...changes } };
     } else if (action === "meeting_delete") {
       const meetingId = text(body.meetingId); if (!meetingId) throw new Error("Meeting is required.");
       const [existingMeeting] = await db.select().from(crmMeetings).where(eq(crmMeetings.id, meetingId)).limit(1); if (!existingMeeting) throw new Error("Meeting was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingMeeting.organizerMemberId !== member.id) throw new Error("You can only delete your own meetings.");
+      if (!await mayManageOwner(db, member, existingMeeting.organizerMemberId)) throw new Error("You can only delete meetings assigned to you or your team.");
+      if (existingMeeting.clientId) await requireClientAccess(db, member, existingMeeting.clientId);
       await db.delete(crmMeetings).where(eq(crmMeetings.id, meetingId)); response = { id: meetingId };
     } else if (action === "bulk_calls") {
-      const rows = Array.isArray(body.rows) ? body.rows as Record<string, unknown>[] : []; if (!rows.length) throw new Error("No call rows were supplied."); const allClients = await db.select().from(crmClients); const elevated = member.role === "admin" || member.role === "manager"; const availableClients = elevated ? allClients : allClients.filter((candidate) => candidate.ownerMemberId === member.id); let imported = 0; const skipped: string[] = []; const existingCalls = await db.select().from(crmColdCalls);
-      for (const row of rows) { const key = text(row.clientId || row.clientCode || row.clientName || row.client || row.prospectName); const candidate = availableClients.find((item) => item.id === key || item.clientCode === key || item.legalName.toLowerCase() === key.toLowerCase()); const prospectName = text(row.prospectName) || (candidate ? candidate.legalName : ""); const calledAt = text(row.calledAt); const outcome = text(row.outcome) || "no_answer"; const duplicate = existingCalls.some((call) => (candidate ? call.clientId === candidate.id : call.prospectName.toLowerCase() === prospectName.toLowerCase()) && call.calledAt === calledAt && call.outcome === outcome); if ((!candidate && !prospectName) || !calledAt || duplicate) { skipped.push(key || "invalid row"); continue; } const record = { id: uid(), clientId: candidate?.id || null, prospectName, callerMemberId: member.id, calledAt, outcome, durationSeconds: Math.max(0, Number(row.durationSeconds) || 0), nextFollowUpAt: text(row.nextFollowUpAt), notes: text(row.notes) }; await db.insert(crmColdCalls).values(record); existingCalls.push(record); imported += 1; }
+      const rows = Array.isArray(body.rows) ? body.rows as Record<string, unknown>[] : []; if (!rows.length) throw new Error("No call rows were supplied."); const allClients = await db.select().from(crmClients); const elevated = member.role === "admin" || member.role === "manager"; const availableClients = elevated ? allClients : allClients.filter((candidate) => candidate.ownerMemberId === member.id || (member.role === "head" && candidate.teamName === member.teamName)); let imported = 0; const skipped: string[] = []; const existingCalls = await db.select().from(crmColdCalls);
+      for (const row of rows) {
+        const key = text(row.clientId || row.clientCode || row.clientName || row.client || row.prospectName);
+        const exact = availableClients.find((item) => item.id === key || item.clientCode === key);
+        const named = availableClients.filter((item) => item.legalName.toLowerCase() === key.toLowerCase());
+        if (!exact && named.length > 1) { skipped.push(`${key}: supply the project client ID`); continue; }
+        const candidate = exact || named[0];
+        const prospectName = text(row.prospectName) || candidate?.legalName || "";
+        const calledAt = text(row.calledAt), outcome = text(row.outcome) || "no_answer";
+        const duplicate = existingCalls.some((call) => (candidate ? call.clientId === candidate.id : call.prospectName.toLowerCase() === prospectName.toLowerCase()) && call.calledAt === calledAt && call.outcome === outcome);
+        if ((!candidate && !prospectName) || !calledAt || duplicate) { skipped.push(key || "invalid row"); continue; }
+        const record = { id: uid(), clientId: candidate?.id || null, prospectName, callerMemberId: member.id, calledAt, outcome, durationSeconds: Math.max(0, Number(row.durationSeconds) || 0), nextFollowUpAt: text(row.nextFollowUpAt), notes: text(row.notes), createdAt: new Date().toISOString() };
+        await db.insert(crmColdCalls).values(record); existingCalls.push(record); imported += 1;
+      }
       response = { id, imported, skipped };
     } else if (action === "reset_password") {
       if (member.role !== "admin" && member.role !== "manager") throw new Error("Only an administrator can reset passwords."); const targetId = text(body.memberId); const temporaryPassword = `Temp-${crypto.randomUUID().slice(0, 8)}`; await db.update(crmMembers).set({ temporaryPassword: await hashPassword(temporaryPassword), forcePasswordChange: true }).where(eq(crmMembers.id, targetId)); response = { id: targetId, tempPassword: temporaryPassword };
@@ -873,6 +963,7 @@ export async function POST(request: Request) {
       const targetId = text(body.memberId); const [target] = await db.select().from(crmMembers).where(eq(crmMembers.id, targetId)).limit(1); if (!target) throw new Error("Team member was not found."); const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && !(member.role === "head" && member.teamName === target.teamName)) throw new Error("Only the team head or administrator can remove members."); if (target.role === "head" && !elevated) throw new Error("A team head cannot remove another team head."); await db.update(crmMembers).set({ isActive: false }).where(eq(crmMembers.id, targetId)); response = { id: targetId };
     } else if (action === "agreement") {
       if (!clientId || !text(body.title)) throw new Error("Client and agreement title are required.");
+      if (text(body.expiryDate) && text(body.effectiveDate) && text(body.expiryDate) <= text(body.effectiveDate)) throw new Error("Agreement expiry must be after its start date.");
       const record = { id, clientId, title: text(body.title), agreementNumber: text(body.agreementNumber), status: text(body.status) || "pending_signature", effectiveDate: text(body.effectiveDate), expiryDate: text(body.expiryDate), valueMinor: rupeesToMinor(body.value), summary: text(body.summary), paymentTerms: text(body.paymentTerms), renewalTerms: text(body.renewalTerms), ownerMemberId: member.id };
       const [duplicate] = await db.select().from(crmAgreements).where(and(eq(crmAgreements.clientId, record.clientId), eq(crmAgreements.title, record.title), eq(crmAgreements.valueMinor, record.valueMinor), eq(crmAgreements.expiryDate, record.expiryDate))).limit(1);
       if (duplicate) { response = { id: duplicate.id, record: duplicate, duplicate: true }; }
@@ -880,12 +971,18 @@ export async function POST(request: Request) {
     } else if (action === "agreement_update") {
       const agreementId = text(body.agreementId); if (!agreementId) throw new Error("Agreement is required.");
       const [existing] = await db.select().from(crmAgreements).where(eq(crmAgreements.id, agreementId)).limit(1); if (!existing) throw new Error("Agreement was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existing.ownerMemberId !== member.id) throw new Error("You can only edit your own agreements.");
-      await db.update(crmAgreements).set({ summary: text(body.summary), paymentTerms: text(body.paymentTerms), renewalTerms: text(body.renewalTerms) }).where(eq(crmAgreements.id, agreementId)); response = { id: agreementId };
+      if (!await mayManageOwner(db, member, existing.ownerMemberId)) throw new Error("You can only edit agreements assigned to you or your team.");
+      await requireClientAccess(db, member, existing.clientId);
+      const effectiveDate = body.effectiveDate === undefined ? existing.effectiveDate : cleanDate(body.effectiveDate);
+      const expiryDate = body.expiryDate === undefined ? existing.expiryDate : cleanDate(body.expiryDate);
+      if (effectiveDate && expiryDate && expiryDate <= effectiveDate) throw new Error("Agreement expiry must be after its start date.");
+      if (body.title !== undefined && !text(body.title)) throw new Error("Agreement title is required.");
+      await db.update(crmAgreements).set({ title: body.title === undefined ? existing.title : text(body.title), effectiveDate, expiryDate, valueMinor: body.value === undefined ? existing.valueMinor : rupeesToMinor(body.value), summary: body.summary === undefined ? existing.summary : text(body.summary), paymentTerms: body.paymentTerms === undefined ? existing.paymentTerms : text(body.paymentTerms), renewalTerms: body.renewalTerms === undefined ? existing.renewalTerms : text(body.renewalTerms) }).where(eq(crmAgreements.id, agreementId)); response = { id: agreementId };
     } else if (action === "agreement_delete") {
       const agreementId = text(body.agreementId); if (!agreementId) throw new Error("Agreement is required.");
       const [existingAgreement] = await db.select().from(crmAgreements).where(eq(crmAgreements.id, agreementId)).limit(1); if (!existingAgreement) throw new Error("Agreement was not found.");
-      const elevated = member.role === "admin" || member.role === "manager"; if (!elevated && existingAgreement.ownerMemberId !== member.id) throw new Error("You can only delete your own agreements.");
+      if (!await mayManageOwner(db, member, existingAgreement.ownerMemberId)) throw new Error("You can only delete agreements assigned to you or your team.");
+      await requireClientAccess(db, member, existingAgreement.clientId);
       await db.update(crmDocuments).set({ deletedAt: new Date().toISOString() }).where(and(eq(crmDocuments.entityType, "agreement"), eq(crmDocuments.entityId, agreementId)));
       await db.delete(crmAgreements).where(eq(crmAgreements.id, agreementId)); response = { id: agreementId };
     } else if (action === "cleanup_demo_associates") {
@@ -901,6 +998,13 @@ export async function POST(request: Request) {
     } else { throw new Error("Unknown CRM action."); }
     await logActivity(member, action || "unknown", action || "unknown", action || "", String(response.id || id), "", JSON.stringify(response.record || response), "CRM action completed");
     crmResponseCache.clear();
-    return Response.json({ ok: true, ...response }, { status: 201 });
-  } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Could not save this CRM record." }, { status: 400 }); }
+    const payload = { ok: true, ...response };
+    await finishCrmWrite(db.$client, guard.key, payload, 201);
+    return Response.json(payload, { status: 201 });
+  } catch (error) {
+    const status = error instanceof RequestGuardError ? error.status : 400;
+    const payload = { error: error instanceof Error ? error.message : "Could not save this CRM record." };
+    if (guard && writeDb) { try { await finishCrmWrite(writeDb.$client, guard.key, payload, status); } catch { /* A pending operation remains locked for safe review. */ } }
+    return Response.json(payload, { status });
+  }
 }
